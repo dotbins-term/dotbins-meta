@@ -90,9 +90,24 @@ github_build() (
     # 2. mirror: GitHub has no pull-mirrors, so push branches+tags ourselves (re-run = sync).
     #    Explicit refspecs, not `push --mirror`: that would also push refs/pull/*, which GitHub rejects.
     ts "cloning upstream $upstream_url"
-    git clone --quiet --bare --shallow-since="1 year ago" "$upstream_url" "$workdir/mirror.git"
+    git clone --quiet --bare "$upstream_url" "$workdir/mirror.git"
+
+    # Depth-independent guard: if the clone is shallow for any reason (flag
+    # added later, upstream is itself shallow, etc.), unshallow it before push.
+    # Pushing from a shallow clone fails with "did not receive expected object".
+    if [[ "$(git -C "$workdir/mirror.git" rev-parse --is-shallow-repository)" == "true" ]]; then
+        ts "clone is shallow; unshallowing before push"
+        git -C "$workdir/mirror.git" fetch --quiet --unshallow --tags
+    fi
+    if [[ "$(git -C "$workdir/mirror.git" rev-parse --is-shallow-repository)" == "true" ]]; then
+        echo "refusing to push from a shallow clone: $upstream_url" >&2
+        exit 1
+    fi
+
     local auth
     auth=$(printf 'x-access-token:%s' "$token" | base64 -w0)   # header, so the token isn't in argv/URL
+
+
 
     #ts "pushing mirror to $target"
     #git -C "$workdir/mirror.git" -c http.extraHeader="Authorization: Basic $auth" \
@@ -139,7 +154,8 @@ github_build() (
 
     # 3. build (autodetect toolchain from repo contents)
     
-    local spec="${BUILD_RECIPE[$repo_name]-__autodetect__}"
+    #local spec="${BUILD_RECIPE[$repo_name]-__autodetect__}"
+    local spec="${BUILD_RECIPE[$repo_name]-}"
     if [[ "$spec" == "" ]]; then
         ts "mirror-only: $repo_name (no build)"
         echo "https://github.com/$target (mirror only)"
