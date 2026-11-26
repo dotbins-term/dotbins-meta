@@ -50,9 +50,19 @@ while read -r repo; do
     fi
 
     n=0
-    while IFS=$'\t' read -r name url; do
-        gh -o "$tmp/$name" "$url"
-        install -m 755 "$tmp/$name" "$dest/$name"   # install replaces the file atomically enough, even if it's running
+
+        while IFS=$'\t' read -r name url; do
+        [[ -n "$name" && -n "$url" ]] || { echo "fail  $repo: empty asset field" >&2; continue; }
+        if ! gh -o "$tmp/$name" "$url"; then
+            echo "fail  $repo $tag: download failed for $name" >&2
+            continue
+        fi
+        [[ -s "$tmp/$name" ]] || { echo "fail  $repo $tag: $name is empty" >&2; continue; }
+        if head -c 15 "$tmp/$name" | grep -qi '<!doctype\|<html'; then
+            echo "fail  $repo $tag: $name is HTML, not a binary" >&2
+            continue
+        fi
+        install -m 755 "$tmp/$name" "$dest/$name"
         echo "new   $repo $tag -> $dest/$name"
         ((n++)) || true
     done < <(json "'\n'.join(a['name'] + '\t' + a['browser_download_url'] for a in d['assets'])" <<< "$rel")
