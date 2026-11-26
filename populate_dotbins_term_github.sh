@@ -21,21 +21,19 @@ UPSTREAM_URLS=(
     "https://github.com/vim/vim"
 )
 
-# repo -> "build_cmd:bin_path_rel"  ("" = mirror only, no build/release)
+
+# Optional overrides. Missing key = auto (upstream release asset → go/cargo build → none).
+#   "cmd:path"          build + upload one file
+#   ":path"             upload a repo file as-is
+#   "upstream:<regex>"  pick specific upstream release assets
+#   "url:<url> [...]"   re-host files from anywhere
+#   "none"              never attach assets
 declare -A BUILD_RECIPE=(
     [password-store]=":src/password-store.sh"
     [fontpreview]=":fontpreview"
-    [lf]="__autodetect__"
-    [fzf]="CGO_ENABLED=0 go build -o fzf .:fzf"
-    [ripgrep]="cargo build --release:target/release/rg"
-    [bat]="cargo build --release:target/release/bat"
-    [vim]="./configure --with-features=huge --disable-gui && make:src/vim"
-    [kitty]="./dev.sh build:kitty/launcher/kitty"
-    [ImageMagick]="./configure --disable-shared && make:utilities/magick"
-    [unzip]="" [unrar]="" [7zip]=""
-    [nerd-fonts]="" [ghostpdl]=""
+    [nerd-fonts]='upstream:^(JetBrainsMono|FiraCode|Hack|NerdFontsSymbolsOnly)\.tar\.xz$'
 )
-
+declare -A ASSET_NAME=( [password-store]=pass )
 
 github_build_all() {
     local owner="${1:-dotbins-term}"
@@ -153,37 +151,101 @@ github_build() (
     default_branch=$(git -C "$workdir/mirror.git" symbolic-ref --short HEAD)
     r=$(gh_api PATCH "/repos/$target" -d "$(jq -n --arg b "$default_branch" '{default_branch:$b}')")
     [[ "$(tail -n1 <<< "$r")" == 200 ]] || die "failed to set default branch on $target" "$r"
-
-         # 3. build (optional). spec: "" = no asset, "cmd:path" = build+upload,
-    #    ":path" = upload file as-is (scripts), "__autodetect__" = guess toolchain
-    local spec="${BUILD_RECIPE[$repo_name]-}"
-    bin_path=""
-    if [[ -n "$spec" ]]; then
-        ts "local clone for build"
-        git clone --quiet "$workdir/mirror.git" "$workdir/src"
-        pushd "$workdir/src" >/dev/null
-        ts "building $repo_name"
-        if [[ "$spec" != "__autodetect__" ]]; then
-            local build_cmd="${spec%%:*}" rel="${spec#*:}"
-            if [[ -n "$build_cmd" ]]; then
-                bash -c "$build_cmd" || { echo "build failed for $repo_name" >&2; exit 1; }
-            fi
-            bin_path="$workdir/src/$rel"
-        elif [[ -f go.mod ]]; then
-            CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$repo_name" .
-            bin_path="$workdir/src/$repo_name"
-        elif [[ -f Cargo.toml ]]; then
-            cargo build --quiet --release
-            bin_path="$workdir/src/target/release/$repo_name"
-        else
-            echo "don't know how to build $repo_name" >&2; exit 1
+    # 3. snapshot once: skip if we already host a release with assets (FORCE=1 to redo)
+    local spec="${BUILD_RECIPE[$repo_name]-__auto__}"
+    local -a assets=()
+    if [[ "$spec" != none && "${FORCE:-0}" != 1 ]]; then
+        r=$(gh_api GET "/repos/$target/releases?per_page=20")
+        if [[ "$(tail -n1 <<< "$r")" == 200 ]] &&
+           sed '$d' <<< "$r" | jq -e 'any(.[]; (.assets | length) > 0)' >/dev/null; then
+            ts "already hosts a release with assets; skipping (FORCE=1 to redo)"
+            echo "https://github.com/$target/releases"
+            exit 0
         fi
-        popd >/dev/null
-        [[ -f "$bin_path" ]] || { echo "artifact not found: $bin_path" >&2; exit 1; }
-    else
-        ts "no recipe for $repo_name: release without asset"
-    fi   
+    fi
+    mkdir -p "$workdir/dl"
 
+    # download upstream latest-release assets; $1 = regex, or "auto" for best linux x86_64 asset
+    fetch_upstream() {
+        local sel="$1" up_repo name url
+        [[ "$upstream_url" == https://github.com/* ]] || return 1
+        up_repo=$(sed -E 's#^https://github\.com/##; s#\.git$##' <<< "$upstream_url")
+        r=$(curl -s -w '\n%{http_code}' -H "Authorization: Bearer $token" \
+            -H "Accept: application/vnd.github+json" "$api/repos/$up_repo/releases/latest")
+        [[ "$(tail -n1 <<< "$r")" == 200 ]] || return 1
+        while IFS=$'\t' read -r name url; do
+            [[ -n "$name" ]] || continue
+            ts "downloading upstream asset $name"
+            curl -fsSL -o "$workdir/dl/$name" "$url" || return 1
+            assets+=("$workdir/dl/$name")
+        done < <(sed '$d' <<< "$r" | jq -r --arg sel "$sel" '
+            def score: (if test("musl"; "i") then 0 else 10 end)
+                     + (if test("\\.(tar\\.[gx]z|txz|tgz)$") then 0 elif test("\\.zip$") then 1 else 2 end);
+            [.assets[] | .name as $n
+              | if $sel == "auto" then
+                    select($n | test("x86_64|amd64|x64"; "i"))
+                  | select($n | test("darwin|macos|apple|windows|win(32|64)|freebsd|netbsd|openbsd|android|\\.(exe|msi|dmg|deb|rpm|apk|sig|asc|pem|sbom|sha256|sha512|sha256sum)$"; "i") | not)
+                else select($n | test($sel)) end]
+            | if $sel == "auto" then sort_by(.name | score) | .[:1] else . end
+            | .[] | "\(.name)\t\(.browser_download_url)"')
+        ((${#assets[@]}))
+    }
+
+    # build from source by detected toolchain; uploads every produced executable
+    auto_build() {
+        [[ -d "$workdir/src" ]] || git clone --quiet "$workdir/mirror.git" "$workdir/src"
+        local out
+        if [[ -f "$workdir/src/go.mod" ]]; then
+            ts "auto-build: go"
+            (cd "$workdir/src" && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$repo_name" .) || return 1
+            assets+=("$workdir/src/$repo_name")
+        elif [[ -f "$workdir/src/Cargo.toml" ]]; then
+            ts "auto-build: cargo (musl)"
+            (cd "$workdir/src" && cargo build --quiet --release --target x86_64-unknown-linux-musl) || return 1
+            out="$workdir/src/target/x86_64-unknown-linux-musl/release"
+            mapfile -t -O "${#assets[@]}" assets < <(find "$out" -maxdepth 1 -type f -executable)
+        else
+            return 1
+        fi
+        ((${#assets[@]}))
+    }
+
+    case "$spec" in
+    none)
+        ts "recipe says none: release without assets"
+        ;;
+    __auto__)
+        if fetch_upstream auto; then
+            ts "using upstream release binary"
+        elif assets=() && auto_build; then
+            ts "built from source"
+        else
+            assets=()
+            ts "nothing to attach for $repo_name: release without assets"
+        fi
+        ;;
+    upstream:*)
+        fetch_upstream "${spec#upstream:}" || { echo "no upstream asset matches ${spec#upstream:}" >&2; exit 1; }
+        ;;
+    url:*)
+        local u
+        for u in ${spec#url:}; do
+            ts "downloading $u"
+            curl -fsSL -o "$workdir/dl/$(basename "$u")" "$u" || { echo "download failed: $u" >&2; exit 1; }
+            assets+=("$workdir/dl/$(basename "$u")")
+        done
+        ;;
+    *)
+        local build_cmd="${spec%%:*}" rel="${spec#*:}"
+        git clone --quiet "$workdir/mirror.git" "$workdir/src"
+        if [[ -n "$build_cmd" ]]; then
+            ts "building $repo_name"
+            (cd "$workdir/src" && bash -c "$build_cmd") || { echo "build failed for $repo_name" >&2; exit 1; }
+        fi
+        [[ -f "$workdir/src/$rel" ]] || { echo "artifact not found: $rel" >&2; exit 1; }
+        assets+=("$workdir/src/$rel")
+        ;;
+    esac
     # 4. tag + release (always); upload binary as asset only if one was built
     ts "creating release"
     tag="v$(date +%Y%m%d%H%M%S)"

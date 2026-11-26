@@ -77,6 +77,7 @@ while read -r repo; do
             echo "fail  $repo $tag: $name is HTML, not a binary" >&2
             failed=1; continue
         fi
+        [[ "$name" == *.AppImage && "$repo" == ImageMagick ]] && name=magick
         install -m 755 "$tmp/$name" "$dest/$name"
         echo "new   $repo $tag -> $dest/$name"
         ((n++)) || true
