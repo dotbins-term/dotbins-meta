@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Download the latest release binaries of every public repo in a GitHub org.
 # Usage: fetch_dotbins.sh [org] [dest_dir]
-# Requires: curl, jq. No token needed (public org); set GITHUB_TOKEN only if you hit the
+# Requires: curl, python3. No token needed (public org); set GITHUB_TOKEN only if you hit the
 # 60 requests/hour unauthenticated API limit.
 set -euo pipefail
 
@@ -21,11 +21,16 @@ gh() {
         ${GITHUB_TOKEN:+-H "Authorization: Bearer $GITHUB_TOKEN"} "$@"
 }
 
+json() {
+    python3 -c 'import sys,json; d=json.load(sys.stdin); print(eval(sys.argv[1]))' "$1"
+}
+
 # list all repo names (paginated, 100 per page)
 list_repos() {
     local page=1 names
     while :; do
-        names=$(gh "$api/orgs/$org/repos?type=public&per_page=100&page=$page" | jq -r '.[].name')
+        names=$(gh "$api/orgs/$org/repos?type=public&per_page=100&page=$page" \
+            | json "'\n'.join(r['name'] for r in d)")
         [[ -n "$names" ]] || break
         echo "$names"
         ((page++))
@@ -37,7 +42,7 @@ while read -r repo; do
         echo "skip  $repo (no release)" >&2
         continue
     }
-    tag=$(jq -r .tag_name <<< "$rel")
+    tag=$(json "d['tag_name']" <<< "$rel")
 
     if [[ -f "$state/$repo" && "$(<"$state/$repo")" == "$tag" ]]; then
         echo "ok    $repo ($tag)"
@@ -50,7 +55,7 @@ while read -r repo; do
         install -m 755 "$tmp/$name" "$dest/$name"   # install replaces the file atomically enough, even if it's running
         echo "new   $repo $tag -> $dest/$name"
         ((n++)) || true
-    done < <(jq -r '.assets[] | [.name, .browser_download_url] | @tsv' <<< "$rel")
+    done < <(json "'\n'.join(a['name'] + '\t' + a['browser_download_url'] for a in d['assets'])" <<< "$rel")
 
     if ((n > 0)); then
         echo "$tag" > "$state/$repo"
