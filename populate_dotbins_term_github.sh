@@ -5,17 +5,17 @@
 # NOTE: intentionally no top-level `set -e` — this file is meant to be sourced.
 
 UPSTREAM_URLS=(
-    "https://github.com/junegunn/fzf"
-    "https://github.com/gokcehan/lf"
-    "https://github.com/zx2c4/password-store"
-    "https://github.com/ryanoasis/nerd-fonts"
     "https://github.com/BurntSushi/ripgrep"
-    "https://github.com/sharkdp/bat"
-    "https://github.com/kovidgoyal/kitty"
     "https://github.com/ArtifexSoftware/ghostpdl"
     "https://gitlab.archlinux.org/archlinux/packaging/packages/unzip"
     "https://gitlab.archlinux.org/archlinux/packaging/packages/unrar"
     "https://gitlab.archlinux.org/archlinux/packaging/packages/7zip"
+    "https://github.com/ryanoasis/nerd-fonts"
+    "https://github.com/junegunn/fzf"
+    "https://github.com/gokcehan/lf"
+    "https://github.com/zx2c4/password-store"
+    "https://github.com/sharkdp/bat"
+    "https://github.com/kovidgoyal/kitty"
     "https://github.com/sdushantha/fontpreview"
     "https://github.com/ImageMagick/ImageMagick"
     "https://github.com/vim/vim"
