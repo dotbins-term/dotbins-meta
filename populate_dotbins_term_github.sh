@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Requires: git, curl, jq, base64, pass (entry: business/social_networks/github_dotbins_term_token)
+#   + toolchains for auto-builds: go, cargo, make/autotools, makepkg (Arch)
 # Token: fine-grained PAT, Resource owner = dotbins-term, All repositories,
 #   Repository permissions: Administration (RW), Contents (RW), Metadata (R)
 # NOTE: intentionally no top-level `set -e` — this file is meant to be sourced.
@@ -21,8 +22,8 @@ UPSTREAM_URLS=(
     "https://github.com/vim/vim"
 )
 
-
-# Optional overrides. Missing key = auto (upstream release asset → go/cargo build → none).
+# Optional overrides. Missing key = auto:
+#   upstream release asset → makepkg / go / cargo / configure+make → none
 #   "cmd:path"          build + upload one file
 #   ":path"             upload a repo file as-is
 #   "upstream:<regex>"  pick specific upstream release assets
@@ -44,7 +45,6 @@ github_build_all() {
 }
 
 github_build() (
-
     SECONDS=0
     ts() { printf '[%s +%ss] %s\n' "$(date +%T)" "$SECONDS" "$*" >&2; }
     set -euo pipefail   # subshell: scoped to this function call only
@@ -52,7 +52,7 @@ github_build() (
     local owner="${2:-dotbins-term}"
     local api="https://api.github.com"
     local uploads="https://uploads.github.com"
-    local repo_name target workdir bin_path tag release_id token default_branch r code
+    local repo_name target workdir tag release_id token default_branch r code
     ts "reading token from pass"
     token=$(pass business/social_networks/github_dotbins_term_token) || {
         echo "couldn't read token from pass" >&2
@@ -81,8 +81,8 @@ github_build() (
         r=$(gh_api POST "/orgs/$owner/repos" -d "$(jq -n --arg n "$repo_name" --arg u "$upstream_url" \
             '{name:$n, description:("mirror of "+$u), homepage:$u,
               has_issues:false, has_wiki:false, has_projects:false}')")
-        gh_api PUT "/repos/$target/actions/permissions" -d '{"enabled":false}' >/dev/null
         [[ "$(tail -n1 <<< "$r")" == 201 ]] || die "failed to create $target" "$r"
+        gh_api PUT "/repos/$target/actions/permissions" -d '{"enabled":false}' >/dev/null
     elif [[ "$code" != 200 ]]; then
         die "unexpected response checking $target" "$r"
     fi
@@ -92,8 +92,6 @@ github_build() (
     ts "cloning upstream $upstream_url"
     git clone --quiet --bare "$upstream_url" "$workdir/mirror.git"
 
-    # Depth-independent guard: if the clone is shallow for any reason (flag
-    # added later, upstream is itself shallow, etc.), unshallow it before push.
     # Pushing from a shallow clone fails with "did not receive expected object".
     if [[ "$(git -C "$workdir/mirror.git" rev-parse --is-shallow-repository)" == "true" ]]; then
         ts "clone is shallow; unshallowing before push"
@@ -107,13 +105,6 @@ github_build() (
     local auth
     auth=$(printf 'x-access-token:%s' "$token" | base64 -w0)   # header, so the token isn't in argv/URL
 
-
-
-    #ts "pushing mirror to $target"
-    #git -C "$workdir/mirror.git" -c http.extraHeader="Authorization: Basic $auth" \
-    #    push --quiet --force "https://github.com/$target.git" \
-    #    'refs/heads/*:refs/heads/*' 'refs/tags/*:refs/tags/*' '^refs/heads/dependabot/*' \
-    #    || { echo "push failed for $target" >&2; exit 1; }
     push() {
         git -C "$workdir/mirror.git" -c http.extraHeader="Authorization: Basic $auth" \
             push --quiet --force "https://github.com/$target.git" "$@"
@@ -124,33 +115,34 @@ github_build() (
         || { echo "branch push failed for $target" >&2; exit 1; }
 
     ts "listing remote tags on $target"
+    local -a remote_tags=() tags=() new_tags=()
     mapfile -t remote_tags < <(
         git -C "$workdir/mirror.git" -c http.extraHeader="Authorization: Basic $auth" \
             ls-remote --tags "https://github.com/$target.git" \
         | awk '{print $2}' | sed 's#^refs/tags/##; s/\^{}$//' | sort -u
     )
-    declare -A have_tag=(); for t in "${remote_tags[@]}"; do have_tag[$t]=1; done
-
-
+    local -A have_tag=()
+    local t
+    for t in "${remote_tags[@]}"; do have_tag[$t]=1; done
 
     mapfile -t tags < <(git -C "$workdir/mirror.git" for-each-ref \
         --format='%(refname):%(refname)' refs/tags)
-    local -a new_tags=()
     for t in "${tags[@]}"; do
-        local name="${t#refs/tags/}"
+        local name="${t%%:*}"; name="${name#refs/tags/}"
         [[ -n "${have_tag[$name]:-}" ]] || new_tags+=("$t")
     done
     ts "pushing ${#new_tags[@]} new tags (${#tags[@]} total) to $target"
+    local i
     for ((i = 0; i < ${#new_tags[@]}; i += 500)); do
         push "${new_tags[@]:i:500}" \
             || { echo "tag push failed for $target at $i" >&2; exit 1; }
     done
 
-
     ts "setting default branch"
     default_branch=$(git -C "$workdir/mirror.git" symbolic-ref --short HEAD)
     r=$(gh_api PATCH "/repos/$target" -d "$(jq -n --arg b "$default_branch" '{default_branch:$b}')")
     [[ "$(tail -n1 <<< "$r")" == 200 ]] || die "failed to set default branch on $target" "$r"
+
     # 3. snapshot once: skip if we already host a release with assets (FORCE=1 to redo)
     local spec="${BUILD_RECIPE[$repo_name]-__auto__}"
     local -a assets=()
@@ -191,19 +183,39 @@ github_build() (
         ((${#assets[@]}))
     }
 
-    # build from source by detected toolchain; uploads every produced executable
+    # build from source by detected toolchain; uploads produced executables/packages
     auto_build() {
         [[ -d "$workdir/src" ]] || git clone --quiet "$workdir/mirror.git" "$workdir/src"
-        local out
-        if [[ -f "$workdir/src/go.mod" ]]; then
+        local s="$workdir/src"
+        local -a new=() inbin=()
+        if [[ -f "$s/PKGBUILD" ]]; then
+            ts "auto-build: makepkg"
+            (cd "$s" && makepkg --syncdeps --noconfirm --nocheck --skippgpcheck) || return 1
+            mapfile -t -O "${#assets[@]}" assets < <(find "$s" -maxdepth 1 -name '*.pkg.tar.*' \
+                ! -name '*-debug-*' ! -name '*.sig')
+        elif [[ -f "$s/go.mod" ]]; then
             ts "auto-build: go"
-            (cd "$workdir/src" && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$repo_name" .) || return 1
-            assets+=("$workdir/src/$repo_name")
-        elif [[ -f "$workdir/src/Cargo.toml" ]]; then
-            ts "auto-build: cargo (musl)"
-            (cd "$workdir/src" && cargo build --quiet --release --target x86_64-unknown-linux-musl) || return 1
-            out="$workdir/src/target/x86_64-unknown-linux-musl/release"
-            mapfile -t -O "${#assets[@]}" assets < <(find "$out" -maxdepth 1 -type f -executable)
+            (cd "$s" && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$repo_name" .) || return 1
+            assets+=("$s/$repo_name")
+        elif [[ -f "$s/Cargo.toml" ]]; then
+            ts "auto-build: cargo"
+            (cd "$s" && cargo build --quiet --release) || return 1
+            mapfile -t -O "${#assets[@]}" assets < <(find "$s/target/release" -maxdepth 1 -type f -executable)
+        elif [[ -e "$s/configure" || -e "$s/autogen.sh" || -f "$s/Makefile" ]]; then
+            ts "auto-build: configure/make"
+            touch "$workdir/stamp"
+            (
+                cd "$s"
+                [[ -e configure || ! -e autogen.sh ]] || sh ./autogen.sh   # ghostpdl's also runs configure
+                [[ -f Makefile || ! -e configure ]] || sh ./configure
+                make -j"$(nproc)"
+            ) || return 1
+            # new ELF executables from this build, skipping objects/tests/libtool dirs
+            mapfile -t new < <(find "$s" -type f -executable -newer "$workdir/stamp" ! -name '*.so*' \
+                ! -path '*/obj/*' ! -path '*/.libs/*' ! -path '*/test*' \
+                -exec sh -c 'head -c4 "$1" | grep -q ELF' _ {} \; -print)
+            mapfile -t inbin < <(printf '%s\n' "${new[@]}" | grep '/bin/' || true)
+            if ((${#inbin[@]})); then assets+=("${inbin[@]}"); else assets+=("${new[@]}"); fi
         else
             return 1
         fi
@@ -246,7 +258,8 @@ github_build() (
         assets+=("$workdir/src/$rel")
         ;;
     esac
-    # 4. tag + release (always); upload binary as asset only if one was built
+
+    # 4. tag + release (always), upload all collected assets
     ts "creating release"
     tag="v$(date +%Y%m%d%H%M%S)"
     r=$(gh_api POST "/repos/$target/releases" -d "$(jq -n --arg t "$tag" --arg c "$default_branch" \
@@ -254,28 +267,25 @@ github_build() (
     [[ "$(tail -n1 <<< "$r")" == 201 ]] || die "failed to create release for $target" "$r"
     release_id=$(sed '$d' <<< "$r" | jq -r .id)
 
-    if [[ -n "$bin_path" ]]; then
-        # assets go to uploads.github.com as a raw body (not multipart like Gitea/Codeberg)
-        ts "uploading asset $(basename "$bin_path")"
+    local a asset
+    for a in "${assets[@]}"; do
+        asset=$(basename "$a")
+        ((${#assets[@]} == 1)) && asset="${ASSET_NAME[$repo_name]:-$asset}"
+        ts "uploading $asset ($(du -h "$a" | cut -f1))"
         r=$(curl -s -w '\n%{http_code}' -X POST \
-            "$uploads/repos/$target/releases/$release_id/assets?name=$(basename "$bin_path")" \
+            "$uploads/repos/$target/releases/$release_id/assets?name=$(jq -rn --arg s "$asset" '$s|@uri')" \
             -H "Authorization: Bearer $token" \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             -H "Content-Type: application/octet-stream" \
-            --data-binary "@$bin_path")
-        [[ "$(tail -n1 <<< "$r")" == 201 ]] || die "failed to upload asset for $target" "$r"
-    else
-        ts "no asset (source archives only)"
-    fi
+            --data-binary "@$a")
+        [[ "$(tail -n1 <<< "$r")" == 201 ]] || die "failed to upload $asset for $target" "$r"
+    done
+    ((${#assets[@]})) || ts "no assets (source archives only)"
 
     ts "done"
     echo "https://github.com/$target/releases/tag/$tag"
 )
-
-
-
-
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     github_build_all "$@"
