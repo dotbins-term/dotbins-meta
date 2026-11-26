@@ -6,7 +6,6 @@
 
 UPSTREAM_URLS=(
     "https://github.com/gokcehan/lf"
-    "https://github.com/vim/vim"
     "https://github.com/zx2c4/password-store"
     "https://github.com/ryanoasis/nerd-fonts"
     "https://github.com/junegunn/fzf"
@@ -19,7 +18,22 @@ UPSTREAM_URLS=(
     "https://gitlab.archlinux.org/archlinux/packaging/packages/7zip"
     "https://github.com/sdushantha/fontpreview"
     "https://github.com/ImageMagick/ImageMagick"
+    "https://github.com/vim/vim"
 )
+
+# repo -> "build_cmd:bin_path_rel"  ("" = mirror only, no build/release)
+declare -A BUILD_RECIPE=(
+    [fzf]="make:bin/fzf"
+    [ripgrep]="cargo build --release:target/release/rg"
+    [bat]="cargo build --release:target/release/bat"
+    [vim]="./configure --with-features=huge --disable-gui && make:src/vim"
+    [kitty]="make:kitty/launcher/kitty"
+    [ImageMagick]="./configure --disable-shared && make:utilities/magick"
+    [password-store]=""
+    [unzip]="" [unrar]="" [7zip]=""
+    [nerd-fonts]="" [ghostpdl]="" [fontpreview]=""
+)
+
 
 github_build_all() {
     local owner="${1:-dotbins-term}"
@@ -30,6 +44,7 @@ github_build_all() {
 }
 
 github_build() (
+
     SECONDS=0
     ts() { printf '[%s +%ss] %s\n' "$(date +%T)" "$SECONDS" "$*" >&2; }
     set -euo pipefail   # subshell: scoped to this function call only
@@ -75,7 +90,7 @@ github_build() (
     # 2. mirror: GitHub has no pull-mirrors, so push branches+tags ourselves (re-run = sync).
     #    Explicit refspecs, not `push --mirror`: that would also push refs/pull/*, which GitHub rejects.
     ts "cloning upstream $upstream_url"
-    git clone --quiet --bare "$upstream_url" "$workdir/mirror.git"
+    git clone --quiet --bare --shallow-since="1 year ago" "$upstream_url" "$workdir/mirror.git"
     local auth
     auth=$(printf 'x-access-token:%s' "$token" | base64 -w0)   # header, so the token isn't in argv/URL
 
@@ -93,14 +108,28 @@ github_build() (
     push 'refs/heads/*:refs/heads/*' '^refs/heads/dependabot/*' \
         || { echo "branch push failed for $target" >&2; exit 1; }
 
+    ts "listing remote tags on $target"
+    mapfile -t remote_tags < <(
+        git -C "$workdir/mirror.git" -c http.extraHeader="Authorization: Basic $auth" \
+            ls-remote --tags "https://github.com/$target.git" \
+        | awk '{print $2}' | sed 's#^refs/tags/##; s/\^{}$//' | sort -u
+    )
+    declare -A have_tag=(); for t in "${remote_tags[@]}"; do have_tag[$t]=1; done
+
+
+
     mapfile -t tags < <(git -C "$workdir/mirror.git" for-each-ref \
         --format='%(refname):%(refname)' refs/tags)
-    for ((i = 0; i < ${#tags[@]}; i += 500)); do
-        ts "pushing tags $i/${#tags[@]} to $target"
-        push "${tags[@]:i:500}" \
+    local -a new_tags=()
+    for t in "${tags[@]}"; do
+        local name="${t#refs/tags/}"
+        [[ -n "${have_tag[$name]:-}" ]] || new_tags+=("$t")
+    done
+    ts "pushing ${#new_tags[@]} new tags (${#tags[@]} total) to $target"
+    for ((i = 0; i < ${#new_tags[@]}; i += 500)); do
+        push "${new_tags[@]:i:500}" \
             || { echo "tag push failed for $target at $i" >&2; exit 1; }
     done
-
 
 
     ts "setting default branch"
@@ -109,11 +138,24 @@ github_build() (
     [[ "$(tail -n1 <<< "$r")" == 200 ]] || die "failed to set default branch on $target" "$r"
 
     # 3. build (autodetect toolchain from repo contents)
+    
+    local spec="${BUILD_RECIPE[$repo_name]-__autodetect__}"
+    if [[ "$spec" == "" ]]; then
+        ts "mirror-only: $repo_name (no build)"
+        echo "https://github.com/$target (mirror only)"
+        return 0
+    fi
+
     ts "local clone for build"
     git clone --quiet "$workdir/mirror.git" "$workdir/src"
     pushd "$workdir/src" >/dev/null
     ts "building $repo_name"
-    if [[ -f go.mod ]]; then
+
+    if [[ "$spec" != "__autodetect__" ]]; then
+        local build_cmd="${spec%%:*}" rel="${spec#*:}"
+        bash -c "$build_cmd" || { echo "build failed for $repo_name" >&2; popd >/dev/null; return 1; }
+        bin_path="$workdir/src/$rel"
+    elif [[ -f go.mod ]]; then
         CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$repo_name" .
         bin_path="$workdir/src/$repo_name"
     elif [[ -f Cargo.toml ]]; then
@@ -131,12 +173,8 @@ github_build() (
         return 1
     fi
     popd >/dev/null
-
-    if [[ -z "${bin_path:-}" || ! -f "$bin_path" ]]; then
-        echo "no binary produced for $repo_name (script-only repo?)" >&2
-        return 1
-    fi
-
+   
+    
     # 4. tag + upload binary as a release asset
     ts "creating release"
     tag="v$(date +%Y%m%d%H%M%S)"
