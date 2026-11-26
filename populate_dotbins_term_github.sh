@@ -5,10 +5,10 @@
 # NOTE: intentionally no top-level `set -e` — this file is meant to be sourced.
 
 UPSTREAM_URLS=(
+    "https://github.com/junegunn/fzf"
     "https://github.com/gokcehan/lf"
     "https://github.com/zx2c4/password-store"
     "https://github.com/ryanoasis/nerd-fonts"
-    "https://github.com/junegunn/fzf"
     "https://github.com/BurntSushi/ripgrep"
     "https://github.com/sharkdp/bat"
     "https://github.com/kovidgoyal/kitty"
@@ -23,15 +23,17 @@ UPSTREAM_URLS=(
 
 # repo -> "build_cmd:bin_path_rel"  ("" = mirror only, no build/release)
 declare -A BUILD_RECIPE=(
-    [fzf]="make:bin/fzf"
+    [password-store]=":src/password-store.sh"
+    [fontpreview]=":fontpreview"
+    [lf]="__autodetect__"
+    [fzf]="CGO_ENABLED=0 go build -o fzf .:fzf"
     [ripgrep]="cargo build --release:target/release/rg"
     [bat]="cargo build --release:target/release/bat"
     [vim]="./configure --with-features=huge --disable-gui && make:src/vim"
-    [kitty]="make:kitty/launcher/kitty"
+    [kitty]="./dev.sh build:kitty/launcher/kitty"
     [ImageMagick]="./configure --disable-shared && make:utilities/magick"
-    [password-store]=""
     [unzip]="" [unrar]="" [7zip]=""
-    [nerd-fonts]="" [ghostpdl]="" [fontpreview]=""
+    [nerd-fonts]="" [ghostpdl]=""
 )
 
 
@@ -152,46 +154,37 @@ github_build() (
     r=$(gh_api PATCH "/repos/$target" -d "$(jq -n --arg b "$default_branch" '{default_branch:$b}')")
     [[ "$(tail -n1 <<< "$r")" == 200 ]] || die "failed to set default branch on $target" "$r"
 
-    # 3. build (autodetect toolchain from repo contents)
-    
-    #local spec="${BUILD_RECIPE[$repo_name]-__autodetect__}"
+         # 3. build (optional). spec: "" = no asset, "cmd:path" = build+upload,
+    #    ":path" = upload file as-is (scripts), "__autodetect__" = guess toolchain
     local spec="${BUILD_RECIPE[$repo_name]-}"
-    if [[ "$spec" == "" ]]; then
-        ts "mirror-only: $repo_name (no build)"
-        echo "https://github.com/$target (mirror only)"
-        return 0
-    fi
-
-    ts "local clone for build"
-    git clone --quiet "$workdir/mirror.git" "$workdir/src"
-    pushd "$workdir/src" >/dev/null
-    ts "building $repo_name"
-
-    if [[ "$spec" != "__autodetect__" ]]; then
-        local build_cmd="${spec%%:*}" rel="${spec#*:}"
-        bash -c "$build_cmd" || { echo "build failed for $repo_name" >&2; popd >/dev/null; return 1; }
-        bin_path="$workdir/src/$rel"
-    elif [[ -f go.mod ]]; then
-        CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$repo_name" .
-        bin_path="$workdir/src/$repo_name"
-    elif [[ -f Cargo.toml ]]; then
-        cargo build --quiet --release
-        bin_path="$workdir/src/target/release/$repo_name"
-    elif [[ -f Makefile ]]; then
-        make --silent
-        bin_path=$(find . -maxdepth 1 -type f -executable | head -n1)
-    elif [[ -f setup.py || -f pyproject.toml ]]; then
-        pip install --quiet --target dist .
-        bin_path=$(find dist/bin -maxdepth 1 -type f 2>/dev/null | head -n1)
-    else
-        echo "don't know how to build $repo_name" >&2
+    bin_path=""
+    if [[ -n "$spec" ]]; then
+        ts "local clone for build"
+        git clone --quiet "$workdir/mirror.git" "$workdir/src"
+        pushd "$workdir/src" >/dev/null
+        ts "building $repo_name"
+        if [[ "$spec" != "__autodetect__" ]]; then
+            local build_cmd="${spec%%:*}" rel="${spec#*:}"
+            if [[ -n "$build_cmd" ]]; then
+                bash -c "$build_cmd" || { echo "build failed for $repo_name" >&2; exit 1; }
+            fi
+            bin_path="$workdir/src/$rel"
+        elif [[ -f go.mod ]]; then
+            CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$repo_name" .
+            bin_path="$workdir/src/$repo_name"
+        elif [[ -f Cargo.toml ]]; then
+            cargo build --quiet --release
+            bin_path="$workdir/src/target/release/$repo_name"
+        else
+            echo "don't know how to build $repo_name" >&2; exit 1
+        fi
         popd >/dev/null
-        return 1
-    fi
-    popd >/dev/null
-   
-    
-    # 4. tag + upload binary as a release asset
+        [[ -f "$bin_path" ]] || { echo "artifact not found: $bin_path" >&2; exit 1; }
+    else
+        ts "no recipe for $repo_name: release without asset"
+    fi   
+
+    # 4. tag + release (always); upload binary as asset only if one was built
     ts "creating release"
     tag="v$(date +%Y%m%d%H%M%S)"
     r=$(gh_api POST "/repos/$target/releases" -d "$(jq -n --arg t "$tag" --arg c "$default_branch" \
@@ -199,18 +192,27 @@ github_build() (
     [[ "$(tail -n1 <<< "$r")" == 201 ]] || die "failed to create release for $target" "$r"
     release_id=$(sed '$d' <<< "$r" | jq -r .id)
 
-    # assets go to uploads.github.com as a raw body (not multipart like Gitea/Codeberg)
-    ts "uploading asset"
-    r=$(curl -s -w '\n%{http_code}' -X POST \
-        "$uploads/repos/$target/releases/$release_id/assets?name=$(basename "$bin_path")" \
-        -H "Authorization: Bearer $token" \
-        -H "Accept: application/vnd.github+json" \
-        -H "Content-Type: application/octet-stream" \
-        --data-binary "@$bin_path")
-    [[ "$(tail -n1 <<< "$r")" == 201 ]] || die "failed to upload asset for $target" "$r"
+    if [[ -n "$bin_path" ]]; then
+        # assets go to uploads.github.com as a raw body (not multipart like Gitea/Codeberg)
+        ts "uploading asset $(basename "$bin_path")"
+        r=$(curl -s -w '\n%{http_code}' -X POST \
+            "$uploads/repos/$target/releases/$release_id/assets?name=$(basename "$bin_path")" \
+            -H "Authorization: Bearer $token" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary "@$bin_path")
+        [[ "$(tail -n1 <<< "$r")" == 201 ]] || die "failed to upload asset for $target" "$r"
+    else
+        ts "no asset (source archives only)"
+    fi
+
     ts "done"
     echo "https://github.com/$target/releases/tag/$tag"
 )
+
+
+
 
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

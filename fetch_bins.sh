@@ -9,6 +9,7 @@ org="${1:-dotbins-term}"
 dest="${2:-$HOME/.local/bin}"
 state="${XDG_STATE_HOME:-$HOME/.local/state}/dotbins/$org"   # remembers installed tag per repo
 api="https://api.github.com"
+skip_repos=(dotbins-meta)
 
 mkdir -p "$dest" "$state"
 tmp=$(mktemp -d)
@@ -46,38 +47,44 @@ list_repos() {
 }
 
 while read -r repo; do
-    rel=$(gh "$api/repos/$org/$repo/releases/latest" 2>/dev/null) || {
-        echo "skip  $repo (no release)" >&2
-        continue
+    [[ -n "$repo" ]] || continue
+    [[ " ${skip_repos[*]} " == *" $repo "* ]] && { echo "skip  $repo (excluded)"; continue; }
+    rels=$(gh "$api/repos/$org/$repo/releases?per_page=20" 2>/dev/null) || {
+        echo "skip  $repo (api error)" >&2; continue
     }
-    tag=$(json "d['tag_name']" <<< "$rel")
+    idx=$(json "next((i for i, r in enumerate(d) if r['assets'] and not r['draft']), -1)" <<< "$rels")
+    if [[ "$idx" == -1 ]]; then
+        echo "skip  $repo (no release with assets)" >&2; continue
+    fi
+    tag=$(json "d[$idx]['tag_name']" <<< "$rels")
 
     if [[ -f "$state/$repo" && "$(<"$state/$repo")" == "$tag" ]]; then
         echo "ok    $repo ($tag)"
         continue
     fi
 
-    n=0
+    n=0 failed=0
 
         while IFS=$'\t' read -r name url; do
-        [[ -n "$name" && -n "$url" ]] || { echo "fail  $repo: empty asset field" >&2; continue; }
+        [[ -n "$name" ]] || continue
         if ! gh -o "$tmp/$name" "$url"; then
             echo "fail  $repo $tag: download failed for $name" >&2
-            continue
+            failed=1; continue
         fi
-        [[ -s "$tmp/$name" ]] || { echo "fail  $repo $tag: $name is empty" >&2; continue; }
+
+        [[ -s "$tmp/$name" ]] || { echo "fail  $repo $tag: $name is empty" >&2; failed=1; continue; }
         if head -c 15 "$tmp/$name" | grep -qi '<!doctype\|<html'; then
             echo "fail  $repo $tag: $name is HTML, not a binary" >&2
-            continue
+            failed=1; continue
         fi
         install -m 755 "$tmp/$name" "$dest/$name"
         echo "new   $repo $tag -> $dest/$name"
         ((n++)) || true
-    done < <(json "'\n'.join(a['name'] + '\t' + a['browser_download_url'] for a in d['assets'])" <<< "$rel")
+    done < <(json "'\n'.join(a['name'] + '\t' + a['browser_download_url'] for a in d[$idx]['assets'])" <<< "$rels")
 
-    if ((n > 0)); then
+
+    if ((n > 0 && failed == 0)); then
         echo "$tag" > "$state/$repo"
-    else
-        echo "skip  $repo ($tag has no assets)" >&2
     fi
+
 done < <(list_repos)
