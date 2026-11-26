@@ -22,7 +22,15 @@ gh() {
 }
 
 json() {
-    python3 -c 'import sys,json; d=json.load(sys.stdin); print(eval(sys.argv[1]))' "$1"
+    python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+r = eval(sys.argv[1])
+if isinstance(r, list):
+    print("\n".join(str(x) for x in r))
+else:
+    print(r)
+' "$1"
 }
 
 # list all repo names (paginated, 100 per page)
