@@ -11,7 +11,7 @@ UPSTREAM_URLS=(
     "https://gitlab.archlinux.org/archlinux/packaging/packages/unzip"
     "https://gitlab.archlinux.org/archlinux/packaging/packages/unrar"
     "https://gitlab.archlinux.org/archlinux/packaging/packages/7zip"
-    #"https://github.com/ryanoasis/nerd-fonts" # emojis are too big, adding them hardcoded
+    #"https://github.com/ryanoasis/nerd-fonts" # emojis/fonts are too big, adding them hardcoded
     "https://github.com/junegunn/fzf"
     "https://github.com/gokcehan/lf"
     "https://github.com/zx2c4/password-store"
