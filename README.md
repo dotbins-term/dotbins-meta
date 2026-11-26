@@ -1,6 +1,6 @@
 # What is in here?
 
-The organization mainly allows me to organize programs that are GREAT to interact with through ssh.
+This organization mainly allows me to organize programs that are GREAT to interact with through ssh.
 
 Scripts to:
 - Make a custom mirror Github -> Github
