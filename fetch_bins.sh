@@ -130,3 +130,11 @@ done < <(list_repos)
 if ((fonts_changed)) && command -v fc-cache >/dev/null; then
     fc-cache -f "$fonts"
 fi
+
+fontdir="${XDG_DATA_HOME:-$HOME/.local/share}/fonts/nerd-fonts"
+for f in JetBrainsMono FiraCode Hack NerdFontsSymbolsOnly; do
+    mkdir -p "$fontdir/$f"
+    curl -fsSL "https://github.com/ryanoasis/nerd-fonts/releases/latest/download/$f.tar.xz" \
+        | tar -xJ -C "$fontdir/$f"
+done
+fc-cache -f "$fontdir"
