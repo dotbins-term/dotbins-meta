@@ -6,6 +6,7 @@
 # NOTE: intentionally no top-level `set -e` — this file is meant to be sourced.
 
 UPSTREAM_URLS=(
+    "https://gitlab.archlinux.org/archlinux/packaging/packages/stow"
     "https://github.com/BurntSushi/ripgrep"
     "https://github.com/ArtifexSoftware/ghostpdl"
     "https://gitlab.archlinux.org/archlinux/packaging/packages/unzip"
