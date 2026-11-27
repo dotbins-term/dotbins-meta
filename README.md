@@ -12,7 +12,17 @@ Scripts to:
 I rarely need to update UI elements. This is a comfy wait to quickly install all binaries within a fresh install somehwere I don't really have a UI (HPC clusters, etc)
 
 literally :
-`curl https://raw.githubusercontent.com/dotbins-term/dotbins-meta/refs/heads/main/fetch_bins.sh | bash `
+
+
+```
+### you may need to install curl, zstd and/or python3
+### these tend to come preinstalled
+
+curl https://raw.githubusercontent.com/dotbins-term/dotbins-meta/refs/heads/main/fetch_bins.sh | bash 
+
+
+
+```
 
 and I don't even need any credential setup.
 
